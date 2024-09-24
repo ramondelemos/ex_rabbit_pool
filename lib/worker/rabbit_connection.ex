@@ -15,14 +15,16 @@ defmodule ExRabbitPool.Worker.RabbitConnection do
             connection: AMQP.Connection.t(),
             channels: list(AMQP.Channel.t()),
             monitors: %{},
-            config: config()
+            config: config(),
+            reuse_channels: boolean()
           }
 
     defstruct adapter: ExRabbitPool.RabbitMQ,
               connection: nil,
               channels: [],
               config: nil,
-              monitors: %{}
+              monitors: %{},
+              reuse_channels: true
   end
 
   ##############
@@ -77,11 +79,15 @@ defmodule ExRabbitPool.Worker.RabbitConnection do
   @impl true
   def init(config) do
     Process.flag(:trap_exit, true)
+
     # split our opts from the ones passed to the amqp client
     {opts, amqp_config} = Keyword.split(config, [:adapter])
     adapter = Keyword.get(opts, :adapter, ExRabbitPool.RabbitMQ)
+
+    reuse_channels = Keyword.get(config, :reuse_channels, false)
+
     send(self(), :connect)
-    {:ok, %State{adapter: adapter, config: amqp_config}}
+    {:ok, %State{adapter: adapter, config: amqp_config, reuse_channels: reuse_channels}}
   end
 
   @impl true
@@ -139,13 +145,35 @@ defmodule ExRabbitPool.Worker.RabbitConnection do
     {:reply, state, state}
   end
 
+  @impl true
+  def handle_cast(
+        {:checkin_channel, %{pid: pid} = channel},
+        %{
+          channels: channels,
+          monitors: monitors,
+          reuse_channels: true
+        } = state
+      ) do
+    new_monitors = remove_monitor(monitors, pid)
+
+    if find_channel(channels, pid) do
+      {:noreply, %State{state | channels: channels, monitors: new_monitors}}
+    else
+      {:noreply, %State{state | channels: channels ++ [channel], monitors: new_monitors}}
+    end
+  end
+
   # When checkin back a channel to the pool is a good practice to not re-use
   # channels, so, we need to remove it from the channel list, unlink it and
   # start a new one
-  @impl true
   def handle_cast(
         {:checkin_channel, %{pid: pid}},
-        %{connection: conn, adapter: adapter, channels: channels, monitors: monitors} = state
+        %{
+          connection: conn,
+          adapter: adapter,
+          channels: channels,
+          monitors: monitors
+        } = state
       ) do
     # only start a new channel when checkin back a channel that isn't removed yet
     # this can happen when a channel crashed or is closed when a client holds it
@@ -358,6 +386,10 @@ defmodule ExRabbitPool.Worker.RabbitConnection do
         true = Process.demonitor(monitor_ref)
         Map.delete(monitors, pid)
     end
+  end
+
+  defp find_channel(channels, channel_pid) do
+    Enum.find(channels, &(&1.pid == channel_pid))
   end
 
   defp find_channel(channels, channel_pid, monitors) do
